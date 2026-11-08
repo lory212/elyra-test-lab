@@ -1,0 +1,46 @@
+<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ELYRA • Banco di prova IndexedDB 0.1</title><style>body{font:16px system-ui;background:#101827;color:#edf2f7;max-width:720px;margin:auto;padding:22px}button{padding:13px;margin:5px 4px 5px 0;border:0;border-radius:9px;background:#84d7c1;color:#10241e;font-weight:700}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#1d2b3c;padding:15px;border-radius:10px}small{color:#b6c5d5}</style></head><body><h1>ELYRA — Banco di prova reale</h1><p>Questo test usa l'IndexedDB del browser che stai utilizzando, non un simulatore. Non modifica i salvataggi di ELYRA.</p><p><b>Passaggio 1:</b> premi «Scrivi», poi chiudi completamente la scheda e riapri <b>lo stesso indirizzo nello stesso browser</b>. Premi «Verifica dopo riapertura».</p><button id="write">1 · Scrivi e verifica</button><button id="read">2 · Verifica dopo riapertura</button><button id="run">Test aggiuntivi</button><button id="copy">Copia rapporto</button><p><small>Serve un'origine stabile HTTPS o localhost. Da file:// l'accesso a IndexedDB e Web Crypto può essere limitato. Il test usa un database distinto: elyra_savecore_step31_lab.</small></p><pre id="output">Pronto.</pre><script>/* ELYRA SaveCore 3.1 — isolated laboratory, not integrated with ELYRA. */
+(function(global){'use strict';
+const DB='elyra_savecore_step31_lab',VERSION=1,SNAP='snapshots',HEAD='heads';
+const enc=new TextEncoder();
+const hash=async s=>Array.from(new Uint8Array(await global.crypto.subtle.digest('SHA-256',enc.encode(s))),x=>x.toString(16).padStart(2,'0')).join('');
+function lifeId(id){if(typeof id!=='string'||!id.trim()||id.length>200)throw Error('Invalid life ID');}
+function validState(id,s){if(!s||typeof s!=='object'||Array.isArray(s)||s.identity?.lifeId!==id)throw Error('Invalid life identity');}
+function open(){return new Promise((ok,no)=>{if(!global.indexedDB)return no(Error('IndexedDB unavailable'));const r=global.indexedDB.open(DB,VERSION);r.onupgradeneeded=()=>{let db=r.result;if(!db.objectStoreNames.contains(SNAP)){let s=db.createObjectStore(SNAP,{keyPath:'id'});s.createIndex('lifeId','lifeId',{unique:false});}if(!db.objectStoreNames.contains(HEAD))db.createObjectStore(HEAD,{keyPath:'lifeId'});};r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error||Error('Open failed'));r.onblocked=()=>no(Error('Database upgrade blocked'));});}
+function atomicWrite(db,id,json,digest){return new Promise((ok,no)=>{let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}let revision;const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);const r=h.get(id);r.onsuccess=()=>{revision=(r.result?.revision||0)+1;const record={id:id+'::'+String(revision).padStart(12,'0'),lifeId:id,revision,json,hash:digest,at:Date.now()};s.add(record);h.put({lifeId:id,revision});};tx.oncomplete=()=>ok(revision);tx.onabort=()=>no(tx.error||Error('Write aborted'));tx.onerror=()=>{};});}
+function allRecords(db,id){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).index('lifeId').getAll(id);let out;r.onsuccess=()=>{out=r.result;};tx.oncomplete=()=>ok((out||[]).sort((a,b)=>b.revision-a.revision));tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+function exactRecord(db,id,revision){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).get(id+'::'+String(revision).padStart(12,'0'));let record;r.onsuccess=()=>{record=r.result;};tx.oncomplete=()=>ok(record);tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+async function verify(id,r){if(!r||r.lifeId!==id||typeof r.json!=='string'||typeof r.hash!=='string'||await hash(r.json)!==r.hash)return null;try{let state=JSON.parse(r.json);validState(id,state);return {revision:r.revision,state};}catch{return null;}}
+class SaveCore{
+ constructor(){this.queues=new Map();}
+ async save(id,state){
+  lifeId(id);validState(id,state);
+  // Snapshot synchronously before joining the asynchronous queue.
+  // Never allow caller mutations to change the payload after save() is requested.
+  const snapshot=JSON.stringify(state);
+  if(typeof snapshot!=='string')throw Error('State serialization failed');
+  const parsed=JSON.parse(snapshot);
+  validState(id,parsed);
+  const previous=this.queues.get(id)||Promise.resolve();
+  const task=previous.catch(()=>{}).then(()=>this._saveSnapshot(id,snapshot));
+  this.queues.set(id,task);
+  try{return await task;}finally{if(this.queues.get(id)===task)this.queues.delete(id);}
+ }
+ async _saveSnapshot(id,json){lifeId(id);const digest=await hash(json),db=await open();let revision;try{revision=await atomicWrite(db,id,json,digest);const record=await exactRecord(db,id,revision);const verified=await verify(id,record);if(!verified||record.json!==json)throw Error('Readback verification failed');return {confirmed:true,revision,hash:digest};}finally{db.close();}}
+ async load(id){lifeId(id);const db=await open();try{for(const r of await allRecords(db,id)){const v=await verify(id,r);if(v)return v;}return null;}finally{db.close();}}
+ async list(){const db=await open();try{const ids=await new Promise((ok,no)=>{const tx=db.transaction(HEAD,'readonly'),r=tx.objectStore(HEAD).getAllKeys();let keys;r.onsuccess=()=>keys=r.result;tx.oncomplete=()=>ok(keys||[]);tx.onabort=()=>no(tx.error||Error('List aborted'));});const out=[];for(const id of ids){if((await allRecords(db,id)).length){let good=false;for(const r of await allRecords(db,id)){if(await verify(id,r)){good=true;break;}}if(good)out.push(id);}}return out;}finally{db.close();}}
+ async exportLife(id){const v=await this.load(id);if(!v)throw Error('No verified save');return JSON.stringify(v.state);}
+ async importLegacy(id,json){lifeId(id);const s=JSON.parse(json);validState(id,s);if(await this.load(id))throw Error('Existing verified life; import refused');return this.save(id,s);}
+}
+global.ELYRA_SaveCore_Step31=new SaveCore();
+})(globalThis);
+</script><script>
+const out=document.getElementById('output');let log=[];const print=(x)=>{log.push({time:new Date().toISOString(),...x});out.textContent=JSON.stringify({environment:{origin:location.origin,secureContext:isSecureContext,indexedDB:typeof indexedDB!=='undefined',cryptoSubtle:!!globalThis.crypto?.subtle,userAgent:navigator.userAgent},tests:log},null,2)};
+const id='elyra_browser_banco_01_fixed', sc=globalThis.ELYRA_SaveCore_Step31;
+const make=(money)=>({identity:{lifeId:id},actors:{alex:{money}},worldVersion:7});
+async function run(name,fn){try{let details=await fn();print({name,result:'PASS',details})}catch(e){print({name,result:'FAIL',error:String(e),stack:e?.stack?.slice(0,700)})}}
+document.getElementById('write').onclick=()=>run('scrittura verificata',async()=>{let nonce=Date.now(),value=nonce%1000000;let result=await sc.save(id,make(value));let read=await sc.load(id);if(!result.confirmed||read?.state?.actors?.alex?.money!==value)throw Error('Readback mismatch');let db=await new Promise((ok,no)=>{let r=indexedDB.open('elyra_banco_01_meta',1);r.onupgradeneeded=()=>r.result.createObjectStore('meta');r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});await new Promise((ok,no)=>{let t=db.transaction('meta','readwrite');t.objectStore('meta').put(value,'expected');t.oncomplete=ok;t.onabort=()=>no(t.error)});db.close();return {revision:result.revision,value,action:'Chiudi la scheda e riapri lo stesso URL, poi premi Verifica'}});
+document.getElementById('read').onclick=()=>run('recupero dopo riapertura',async()=>{let db=await new Promise((ok,no)=>{let r=indexedDB.open('elyra_banco_01_meta',1);r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});let expected=await new Promise((ok,no)=>{let t=db.transaction('meta');let r=t.objectStore('meta').get('expected');r.onsuccess=()=>ok(r.result);r.onerror=()=>no(r.error)});db.close();if(typeof expected!=='number')throw Error('Prima esegui Scrivi');let restored=await sc.load(id);if(restored?.state?.actors?.alex?.money!==expected)throw Error('Persistenza non confermata');return {expected,actual:restored.state.actors.alex.money,revision:restored.revision}});
+document.getElementById('run').onclick=()=>run('revisioni, code, isolamento',async()=>{let a=make(501);let p=sc.save(id,a);a.actors.alex.money=999;let r1=await p;let first=await sc.load(id);if(first.state.actors.alex.money!==501)throw Error('Snapshot mutato');let p2=sc.save(id,make(502)),p3=sc.save(id,make(503));let [r2,r3]=await Promise.all([p2,p3]);let last=await sc.load(id);if(r2.revision!==r1.revision+1||r3.revision!==r2.revision+1||last.state.actors.alex.money!==503)throw Error('Revisioni incoerenti');let other=id+'_other';await sc.save(other,{identity:{lifeId:other},actors:{alex:{money:700}},worldVersion:7});if((await sc.load(other)).state.actors.alex.money!==700)throw Error('Vite non isolate');return {revisions:[r1.revision,r2.revision,r3.revision],latest:503,multipleLives:true}});
+document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(out.textContent);print({name:'copia rapporto',result:'PASS'})}catch(e){print({name:'copia rapporto',result:'FAIL',error:String(e)})}};
+print({name:'ambiente pronto',result:'INFO'});
+</script></body></html>
