@@ -1,0 +1,130 @@
+<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ELYRA Save Safety 1.8</title><style>body{font-family:system-ui;background:#111827;color:#f9fafb;padding:18px;max-width:850px;margin:auto}button{padding:14px;border-radius:9px;background:#7dd3fc;border:0;margin:6px 6px 6px 0;font-weight:700}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#1f2937;padding:14px;border-radius:10px}h1{font-size:24px}</style><h1>ELYRA Save Safety 1.8</h1><p>Collaudo coda limitata, senza modificare ELYRA.</p><button id="run">Esegui collaudo</button><button id="copy">Copia rapporto</button><pre id="out">Pronto.</pre><script>/* ELYRA SaveCore 3.1 — isolated laboratory, not integrated with ELYRA. */
+(function(global){'use strict';
+const DB='elyra_savecore_occ16_lab',VERSION=1,SNAP='snapshots',HEAD='heads';
+const enc=new TextEncoder();
+const hash=async s=>Array.from(new Uint8Array(await global.crypto.subtle.digest('SHA-256',enc.encode(s))),x=>x.toString(16).padStart(2,'0')).join('');
+function lifeId(id){if(typeof id!=='string'||!id.trim()||id.length>200)throw Error('Invalid life ID');}
+function validState(id,s){if(!s||typeof s!=='object'||Array.isArray(s)||s.identity?.lifeId!==id)throw Error('Invalid life identity');}
+function open(){return new Promise((ok,no)=>{if(!global.indexedDB)return no(Error('IndexedDB unavailable'));const r=global.indexedDB.open(DB,VERSION);r.onupgradeneeded=()=>{let db=r.result;if(!db.objectStoreNames.contains(SNAP)){let s=db.createObjectStore(SNAP,{keyPath:'id'});s.createIndex('lifeId','lifeId',{unique:false});}if(!db.objectStoreNames.contains(HEAD))db.createObjectStore(HEAD,{keyPath:'lifeId'});};r.onsuccess=()=>{const db=r.result;db.onversionchange=()=>db.close();ok(db);};r.onerror=()=>no(r.error||Error('Open failed'));r.onblocked=()=>no(Error('Database upgrade blocked'));});}
+function atomicWrite(db,id,json,digest,expectedRevision){return new Promise((ok,no)=>{
+ let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}
+ const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);
+ const head=h.get(id),index=s.index('lifeId');
+ // The latest snapshot, not HEAD alone, determines the next revision.
+ // This protects against missing/stale HEAD and preserves all orphaned snapshots.
+ const latest=index.openCursor(IDBKeyRange.only(id),'prev');
+ let headRevision=0,snapshotRevision=0,checks=0,revision,conflict=false;
+ function ready(){if(++checks!==2)return;
+   const current=Math.max(headRevision,snapshotRevision);
+   if(expectedRevision!==current){conflict=true;tx.abort();return;}
+   revision=current+1;
+   s.add({id:id+'::'+String(revision).padStart(12,'0'),lifeId:id,revision,json,hash:digest,at:Date.now()});
+   h.put({lifeId:id,revision});
+ }
+ head.onsuccess=()=>{headRevision=Number.isSafeInteger(head.result?.revision)&&head.result.revision>=0?head.result.revision:0;ready();};
+ latest.onsuccess=()=>{snapshotRevision=Number.isSafeInteger(latest.result?.value?.revision)?latest.result.value.revision:0;ready();};
+ tx.oncomplete=()=>ok(revision);
+ tx.onabort=()=>no(conflict?Object.assign(Error('Revision conflict'),{code:'REVISION_CONFLICT',expectedRevision}):(tx.error||Error('Write aborted')));
+ tx.onerror=()=>{};
+ });}
+// Exclusive import: occupancy check and snapshot insertion in ONE IndexedDB transaction.
+// Checking only HEAD is insufficient: an orphaned/corrupt snapshot still reserves its ID.
+function atomicImport(db,id,json,digest){return new Promise((ok,no)=>{
+ let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}
+ const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);
+ let revision=1, rejected=false;
+ const head=h.get(id), existing=s.index('lifeId').count(IDBKeyRange.only(id));
+ let headPresent=false,snapshotPresent=false,checks=0;
+ function checked(){if(++checks!==2)return;
+  if(headPresent||snapshotPresent){rejected=true;try{tx.abort();}catch{}return;}
+  s.add({id:id+'::000000000001',lifeId:id,revision,json,hash:digest,at:Date.now()});
+  h.add({lifeId:id,revision});
+ }
+ head.onsuccess=()=>{headPresent=!!head.result;checked();};
+ existing.onsuccess=()=>{snapshotPresent=existing.result>0;checked();};
+ tx.oncomplete=()=>ok(revision);
+ tx.onabort=()=>no(rejected?Error('Life ID already occupied; import refused'):(tx.error||Error('Import aborted')));
+ tx.onerror=()=>{};
+ });}
+function allRecords(db,id){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).index('lifeId').getAll(id);let out;r.onsuccess=()=>{out=r.result;};tx.oncomplete=()=>ok((out||[]).sort((a,b)=>b.revision-a.revision));tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+function exactRecord(db,id,revision){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).get(id+'::'+String(revision).padStart(12,'0'));let record;r.onsuccess=()=>{record=r.result;};tx.oncomplete=()=>ok(record);tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+async function verify(id,r){if(!r||r.lifeId!==id||typeof r.json!=='string'||typeof r.hash!=='string'||await hash(r.json)!==r.hash)return null;try{let state=JSON.parse(r.json);validState(id,state);return {revision:r.revision,state};}catch{return null;}}
+class SaveCore{
+ constructor(){this.queues=new Map();this.pending=new Map();this.MAX_PENDING_PER_LIFE=8;}
+ _enqueue(id,run){
+  const count=this.pending.get(id)||0;
+  if(count>=this.MAX_PENDING_PER_LIFE)return Promise.reject(Object.assign(Error('Save queue full; retry after pending writes settle'),{code:'SAVE_QUEUE_FULL',lifeId:id}));
+  this.pending.set(id,count+1);
+  const previous=this.queues.get(id)||Promise.resolve();
+  const task=previous.catch(()=>{}).then(run);
+  this.queues.set(id,task);
+  // Cleanup is attached to a handled promise, avoiding unhandled rejections.
+  const settled=task.then(value=>({ok:true,value}),error=>({ok:false,error}));
+  return settled.then(result=>{
+   const remaining=(this.pending.get(id)||1)-1;
+   if(remaining)this.pending.set(id,remaining);else this.pending.delete(id);
+   if(this.queues.get(id)===task)this.queues.delete(id);
+   if(result.ok)return result.value;
+   throw result.error;
+  });
+ }
+ async save(id,state,expectedRevision){
+  if(!Number.isSafeInteger(expectedRevision)||expectedRevision<0)throw Error('expectedRevision required');
+  lifeId(id);validState(id,state);
+  // Snapshot synchronously before joining the asynchronous queue.
+  // Never allow caller mutations to change the payload after save() is requested.
+  const snapshot=JSON.stringify(state);
+  if(typeof snapshot!=='string')throw Error('State serialization failed');
+  const parsed=JSON.parse(snapshot);
+  validState(id,parsed);
+  return this._enqueue(id,()=>this._saveSnapshot(id,snapshot,expectedRevision));
+ }
+ async _saveSnapshot(id,json,expectedRevision){lifeId(id);const digest=await hash(json),db=await open();let revision;try{revision=await atomicWrite(db,id,json,digest,expectedRevision);const record=await exactRecord(db,id,revision);const verified=await verify(id,record);if(!verified||record.json!==json)throw Error('Readback verification failed');return {confirmed:true,revision,hash:digest};}finally{db.close();}}
+ async importExclusive(id,state){
+  lifeId(id);validState(id,state);
+  const snapshot=JSON.stringify(state);if(typeof snapshot!=='string')throw Error('Serialization failed');
+  validState(id,JSON.parse(snapshot));
+  return this._enqueue(id,async()=>{
+   const digest=await hash(snapshot),db=await open();
+   try{const revision=await atomicImport(db,id,snapshot,digest);
+    const record=await exactRecord(db,id,revision),v=await verify(id,record);
+    if(!v||record.json!==snapshot)throw Error('Exclusive import readback failed');
+    return {confirmed:true,revision,hash:digest};
+   }finally{db.close();}
+  });
+ }
+ async load(id){lifeId(id);const db=await open();try{for(const r of await allRecords(db,id)){const v=await verify(id,r);if(v)return v;}return null;}finally{db.close();}}
+ async list(){const db=await open();try{const ids=await new Promise((ok,no)=>{const tx=db.transaction(HEAD,'readonly'),r=tx.objectStore(HEAD).getAllKeys();let keys;r.onsuccess=()=>keys=r.result;tx.oncomplete=()=>ok(keys||[]);tx.onabort=()=>no(tx.error||Error('List aborted'));});const out=[];for(const id of ids){if((await allRecords(db,id)).length){let good=false;for(const r of await allRecords(db,id)){if(await verify(id,r)){good=true;break;}}if(good)out.push(id);}}return out;}finally{db.close();}}
+ async exportLife(id){const v=await this.load(id);if(!v)throw Error('No verified save');return JSON.stringify(v.state);}
+ async importLegacy(id,json){lifeId(id);const s=JSON.parse(json);validState(id,s);return this.importExclusive(id,s);}
+}
+global.ELYRA_SaveCore_Step31=new SaveCore();
+})(globalThis);
+</script><script>
+const core=globalThis.ELYRA_SaveCore_Step31;let report;
+const state=(id,money)=>({identity:{lifeId:id},actors:{alex:{}},money});
+function check(name,fn){return Promise.resolve().then(fn).then(details=>({name,result:'PASS',details})).catch(e=>({name,result:'FAIL',error:String(e),stack:e.stack}));}
+function assert(v,msg){if(!v)throw Error(msg)}
+const pause=()=>new Promise(r=>setTimeout(r,0));
+async function run(){document.getElementById('out').textContent='Test in corso...';const tests=[];
+const id='ss18-'+Date.now()+'-'+Math.random().toString(36).slice(2);
+const original=core._saveSnapshot.bind(core);let release;const gate=new Promise(r=>release=r);let started=false;
+core._saveSnapshot=async function(life,json,rev){if(life===id){started=true;await gate;}return original(life,json,rev)};
+try{
+ tests.push(await check('otto richieste ammesse e nona rifiutata',async()=>{
+  const pending=Array.from({length:8},()=>core.save(id,state(id,10),0));
+  await pause();let error=null;try{await core.save(id,state(id,99),0)}catch(e){error=e}
+  assert(error?.code==='SAVE_QUEUE_FULL','Manca SAVE_QUEUE_FULL');assert(core.pending.get(id)===8,'Contatore errato');
+  return {accepted:pending.length,rejectedCode:error.code,started,pendingPromises:pending};
+ }));
+ // Remove promises from the displayed report; they are tracked separately below.
+ const first=tests[0];const pending=first.details?.pendingPromises;if(first.details)delete first.details.pendingPromises;
+ release();if(pending){const settled=await Promise.allSettled(pending);tests.push({name:'coda drenata senza perdite silenziose',result:settled.length===8&&settled.every(x=>x.status==='fulfilled'||x.status==='rejected')?'PASS':'FAIL',details:{fulfilled:settled.filter(x=>x.status==='fulfilled').length,rejected:settled.filter(x=>x.status==='rejected').length,errors:settled.filter(x=>x.status==='rejected').map(x=>x.reason?.code||String(x.reason)),pending:core.pending.get(id)||0}})}
+ tests.push(await check('scrittura reale dopo svuotamento',async()=>{const loaded=await core.load(id);assert(loaded?.revision===1,'Snapshot iniziale mancante');const next=await core.save(id,state(id,303),loaded.revision);assert(next.revision===2,'Revisione non avanzata');const again=await core.load(id);assert(again?.state?.money===303,'Denaro non conservato');return {revision:again.revision,money:again.state.money};}));
+ const other=id+'-other';tests.push(await check('altra vita indipendente',async()=>{const out=await core.save(other,state(other,7),0);return {revision:out.revision}}));
+ tests.push(await check('pulizia coda dopo errore',async()=>{let conflict;try{await core.save(other,state(other,8),0)}catch(e){conflict=e}assert(conflict?.code==='REVISION_CONFLICT','Conflitto non rilevato');assert(!core.pending.has(other),'Pending non ripulito');const ok=await core.save(other,state(other,9),1);return {conflict:conflict.code,retryRevision:ok.revision};}));
+}finally{core._saveSnapshot=original;release();}
+report={environment:{origin:location.origin,indexedDB:!!indexedDB,cryptoSubtle:!!crypto?.subtle},tests};document.getElementById('out').textContent=JSON.stringify(report,null,2);
+}
+document.getElementById('run').onclick=()=>run().catch(e=>{document.getElementById('out').textContent='Errore harness: '+String(e)+'\n'+e.stack});document.getElementById('copy').onclick=()=>navigator.clipboard.writeText(JSON.stringify(report,null,2)).catch(()=>alert('Seleziona e copia il rapporto manualmente'));
+</script></html>
