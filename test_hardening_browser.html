@@ -1,0 +1,104 @@
+<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ELYRA Save Safety 1.4</title><style>body{background:#101c2d;color:#f3f7ff;font:17px system-ui;padding:20px;max-width:760px;margin:auto}button{padding:15px;margin:6px 6px 12px 0;border:0;border-radius:10px;background:#76d6bf;color:#102333;font-weight:700}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#213249;padding:15px;border-radius:10px}</style><h1>ELYRA · Save Safety 1.4</h1><p>Test isolati su IndexedDB reale. Database separato, solo vite fittizie.</p><button id="run">Esegui 4 test</button><button id="copy">Copia rapporto</button><pre id="out">Pronto.</pre><script>/* ELYRA SaveCore 3.1 — isolated laboratory, not integrated with ELYRA. */
+(function(global){'use strict';
+const DB='elyra_savecore_hardening14_lab',VERSION=1,SNAP='snapshots',HEAD='heads';
+const enc=new TextEncoder();
+const hash=async s=>Array.from(new Uint8Array(await global.crypto.subtle.digest('SHA-256',enc.encode(s))),x=>x.toString(16).padStart(2,'0')).join('');
+function lifeId(id){if(typeof id!=='string'||!id.trim()||id.length>200)throw Error('Invalid life ID');}
+function validState(id,s){if(!s||typeof s!=='object'||Array.isArray(s)||s.identity?.lifeId!==id)throw Error('Invalid life identity');}
+function open(){return new Promise((ok,no)=>{if(!global.indexedDB)return no(Error('IndexedDB unavailable'));const r=global.indexedDB.open(DB,VERSION);r.onupgradeneeded=()=>{let db=r.result;if(!db.objectStoreNames.contains(SNAP)){let s=db.createObjectStore(SNAP,{keyPath:'id'});s.createIndex('lifeId','lifeId',{unique:false});}if(!db.objectStoreNames.contains(HEAD))db.createObjectStore(HEAD,{keyPath:'lifeId'});};r.onsuccess=()=>{const db=r.result;db.onversionchange=()=>db.close();ok(db);};r.onerror=()=>no(r.error||Error('Open failed'));r.onblocked=()=>no(Error('Database upgrade blocked'));});}
+function atomicWrite(db,id,json,digest){return new Promise((ok,no)=>{
+ let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}
+ const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);
+ const head=h.get(id),index=s.index('lifeId');
+ // The latest snapshot, not HEAD alone, determines the next revision.
+ // This protects against missing/stale HEAD and preserves all orphaned snapshots.
+ const latest=index.openCursor(IDBKeyRange.only(id),'prev');
+ let headRevision=0,snapshotRevision=0,checks=0,revision;
+ function ready(){if(++checks!==2)return;
+   revision=Math.max(headRevision,snapshotRevision)+1;
+   s.add({id:id+'::'+String(revision).padStart(12,'0'),lifeId:id,revision,json,hash:digest,at:Date.now()});
+   h.put({lifeId:id,revision});
+ }
+ head.onsuccess=()=>{headRevision=Number.isSafeInteger(head.result?.revision)&&head.result.revision>=0?head.result.revision:0;ready();};
+ latest.onsuccess=()=>{snapshotRevision=Number.isSafeInteger(latest.result?.value?.revision)?latest.result.value.revision:0;ready();};
+ tx.oncomplete=()=>ok(revision);
+ tx.onabort=()=>no(tx.error||Error('Write aborted'));
+ tx.onerror=()=>{};
+ });}
+// Exclusive import: occupancy check and snapshot insertion in ONE IndexedDB transaction.
+// Checking only HEAD is insufficient: an orphaned/corrupt snapshot still reserves its ID.
+function atomicImport(db,id,json,digest){return new Promise((ok,no)=>{
+ let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}
+ const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);
+ let revision=1, rejected=false;
+ const head=h.get(id), existing=s.index('lifeId').count(IDBKeyRange.only(id));
+ let headPresent=false,snapshotPresent=false,checks=0;
+ function checked(){if(++checks!==2)return;
+  if(headPresent||snapshotPresent){rejected=true;try{tx.abort();}catch{}return;}
+  s.add({id:id+'::000000000001',lifeId:id,revision,json,hash:digest,at:Date.now()});
+  h.add({lifeId:id,revision});
+ }
+ head.onsuccess=()=>{headPresent=!!head.result;checked();};
+ existing.onsuccess=()=>{snapshotPresent=existing.result>0;checked();};
+ tx.oncomplete=()=>ok(revision);
+ tx.onabort=()=>no(rejected?Error('Life ID already occupied; import refused'):(tx.error||Error('Import aborted')));
+ tx.onerror=()=>{};
+ });}
+function allRecords(db,id){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).index('lifeId').getAll(id);let out;r.onsuccess=()=>{out=r.result;};tx.oncomplete=()=>ok((out||[]).sort((a,b)=>b.revision-a.revision));tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+function exactRecord(db,id,revision){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).get(id+'::'+String(revision).padStart(12,'0'));let record;r.onsuccess=()=>{record=r.result;};tx.oncomplete=()=>ok(record);tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+async function verify(id,r){if(!r||r.lifeId!==id||typeof r.json!=='string'||typeof r.hash!=='string'||await hash(r.json)!==r.hash)return null;try{let state=JSON.parse(r.json);validState(id,state);return {revision:r.revision,state};}catch{return null;}}
+class SaveCore{
+ constructor(){this.queues=new Map();}
+ async save(id,state){
+  lifeId(id);validState(id,state);
+  // Snapshot synchronously before joining the asynchronous queue.
+  // Never allow caller mutations to change the payload after save() is requested.
+  const snapshot=JSON.stringify(state);
+  if(typeof snapshot!=='string')throw Error('State serialization failed');
+  const parsed=JSON.parse(snapshot);
+  validState(id,parsed);
+  const previous=this.queues.get(id)||Promise.resolve();
+  const task=previous.catch(()=>{}).then(()=>this._saveSnapshot(id,snapshot));
+  this.queues.set(id,task);
+  try{return await task;}finally{if(this.queues.get(id)===task)this.queues.delete(id);}
+ }
+ async _saveSnapshot(id,json){lifeId(id);const digest=await hash(json),db=await open();let revision;try{revision=await atomicWrite(db,id,json,digest);const record=await exactRecord(db,id,revision);const verified=await verify(id,record);if(!verified||record.json!==json)throw Error('Readback verification failed');return {confirmed:true,revision,hash:digest};}finally{db.close();}}
+ async importExclusive(id,state){
+  lifeId(id);validState(id,state);
+  const snapshot=JSON.stringify(state);if(typeof snapshot!=='string')throw Error('Serialization failed');
+  validState(id,JSON.parse(snapshot));
+  const previous=this.queues.get(id)||Promise.resolve();
+  const task=previous.catch(()=>{}).then(async()=>{
+   const digest=await hash(snapshot),db=await open();
+   try{const revision=await atomicImport(db,id,snapshot,digest);
+    const record=await exactRecord(db,id,revision),v=await verify(id,record);
+    if(!v||record.json!==snapshot)throw Error('Exclusive import readback failed');
+    return {confirmed:true,revision,hash:digest};
+   }finally{db.close();}
+  });
+  this.queues.set(id,task);
+  try{return await task;}finally{if(this.queues.get(id)===task)this.queues.delete(id);}
+ }
+ async load(id){lifeId(id);const db=await open();try{for(const r of await allRecords(db,id)){const v=await verify(id,r);if(v)return v;}return null;}finally{db.close();}}
+ async list(){const db=await open();try{const ids=await new Promise((ok,no)=>{const tx=db.transaction(HEAD,'readonly'),r=tx.objectStore(HEAD).getAllKeys();let keys;r.onsuccess=()=>keys=r.result;tx.oncomplete=()=>ok(keys||[]);tx.onabort=()=>no(tx.error||Error('List aborted'));});const out=[];for(const id of ids){if((await allRecords(db,id)).length){let good=false;for(const r of await allRecords(db,id)){if(await verify(id,r)){good=true;break;}}if(good)out.push(id);}}return out;}finally{db.close();}}
+ async exportLife(id){const v=await this.load(id);if(!v)throw Error('No verified save');return JSON.stringify(v.state);}
+ async importLegacy(id,json){lifeId(id);const s=JSON.parse(json);validState(id,s);return this.importExclusive(id,s);}
+}
+global.ELYRA_SaveCore_Step31=new SaveCore();
+})(globalThis);
+</script><script>
+const DB='elyra_savecore_hardening14_lab', report={environment:{origin:location.origin,indexedDB:!!indexedDB},tests:[]};
+const core=globalThis.ELYRA_SaveCore_Step31;
+function record(name,result,details){report.tests.push({name,result,details});document.getElementById('out').textContent=JSON.stringify(report,null,2)}
+function assert(x,m){if(!x)throw Error(m)}
+function dbOpen(){return new Promise((yes,no)=>{let r=indexedDB.open(DB);r.onsuccess=()=>yes(r.result);r.onerror=()=>no(r.error)})}
+async function mutateHead(id,mode){let db=await dbOpen();try{await new Promise((yes,no)=>{let tx=db.transaction('heads','readwrite'),store=tx.objectStore('heads');if(mode==='delete')store.delete(id);else store.put({lifeId:id,revision:1});tx.oncomplete=yes;tx.onabort=()=>no(tx.error)})}finally{db.close()}}
+async function test(name,fn){try{record(name,'PASS',await fn())}catch(e){record(name,'FAIL',String(e&&e.message||e))}}
+document.getElementById('run').onclick=async()=>{document.getElementById('run').disabled=true;report.tests=[];const nonce=Date.now()+'-'+Math.random().toString(36).slice(2);const make=(id,money)=>({identity:{lifeId:id},actors:{alex:{name:'Alex'}},money});
+await test('HEAD assente: revisione recuperata',async()=>{const id='head-missing-'+nonce;await core.save(id,make(id,10));await core.save(id,make(id,20));await mutateHead(id,'delete');let r=await core.save(id,make(id,30)),v=await core.load(id);assert(r.revision===3&&v.state.money===30,'recovery failed');return {revision:r.revision,money:v.state.money}});
+await test('HEAD obsoleto: nessuna collisione',async()=>{const id='head-stale-'+nonce;await core.save(id,make(id,10));await core.save(id,make(id,20));await mutateHead(id,'stale');let r=await core.save(id,make(id,30));assert(r.revision===3,'wrong revision');return {revision:r.revision}});
+await test('due istanze concorrenti: revisioni distinte',async()=>{const id='cross-instance-'+nonce;let a=new core.constructor(),b=new core.constructor();const r=await Promise.all([a.save(id,make(id,1)),b.save(id,make(id,2))]);const revisions=r.map(x=>x.revision).sort();assert(revisions.join(',')==='1,2','collision');return {revisions}});
+await test('importazione esclusiva non sovrascrive',async()=>{const id='exclusive-'+nonce;await core.importExclusive(id,make(id,7));let rejected=false;try{await core.importExclusive(id,make(id,8))}catch{rejected=true}const v=await core.load(id);assert(rejected&&v.state.money===7,'overwrite');return {rejected,money:v.state.money}});
+document.getElementById('run').disabled=false};
+document.getElementById('copy').onclick=()=>navigator.clipboard.writeText(JSON.stringify(report,null,2));
+</script></html>
