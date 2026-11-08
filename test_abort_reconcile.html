@@ -1,0 +1,126 @@
+<!doctype html><html lang="it"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ELYRA Save Safety 1.9</title><style>body{font:16px system-ui,sans-serif;max-width:720px;margin:auto;padding:20px;background:#f7f8fb;color:#17212f}button{padding:14px;margin:6px 5px 6px 0;border:0;border-radius:9px;background:#1659bd;color:white;font-size:16px}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:white;padding:12px;border-radius:10px}h1{font-size:23px}.note{color:#48566a}</style><h1>ELYRA Save Safety 1.9</h1><p>Collaudo transazioni interrotte e conferme incerte. Database di laboratorio isolato: non modifica ELYRA 0.17.</p><button id="run">Esegui collaudo</button><button id="copy">Copia rapporto</button><p class="note">Non simula lo spegnimento fisico del telefono: verifica abort controllato e perdita simulata della conferma.</p><pre id="out">In attesa.</pre><script>(function(global){'use strict';
+const DB='elyra_savecore_ss19_lab',VERSION=1,SNAP='snapshots',HEAD='heads';
+const enc=new TextEncoder();
+const hash=async s=>Array.from(new Uint8Array(await global.crypto.subtle.digest('SHA-256',enc.encode(s))),x=>x.toString(16).padStart(2,'0')).join('');
+function lifeId(id){if(typeof id!=='string'||!id.trim()||id.length>200)throw Error('Invalid life ID');}
+function validState(id,s){if(!s||typeof s!=='object'||Array.isArray(s)||s.identity?.lifeId!==id)throw Error('Invalid life identity');}
+function open(){return new Promise((ok,no)=>{if(!global.indexedDB)return no(Error('IndexedDB unavailable'));const r=global.indexedDB.open(DB,VERSION);r.onupgradeneeded=()=>{let db=r.result;if(!db.objectStoreNames.contains(SNAP)){let s=db.createObjectStore(SNAP,{keyPath:'id'});s.createIndex('lifeId','lifeId',{unique:false});}if(!db.objectStoreNames.contains(HEAD))db.createObjectStore(HEAD,{keyPath:'lifeId'});};r.onsuccess=()=>{const db=r.result;db.onversionchange=()=>db.close();ok(db);};r.onerror=()=>no(r.error||Error('Open failed'));r.onblocked=()=>no(Error('Database upgrade blocked'));});}
+function atomicWrite(db,id,json,digest,expectedRevision){return new Promise((ok,no)=>{
+ let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}
+ const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);
+ const head=h.get(id),index=s.index('lifeId');
+ // The latest snapshot, not HEAD alone, determines the next revision.
+ // This protects against missing/stale HEAD and preserves all orphaned snapshots.
+ const latest=index.openCursor(IDBKeyRange.only(id),'prev');
+ let headRevision=0,snapshotRevision=0,checks=0,revision,conflict=false;
+ function ready(){if(++checks!==2)return;
+   const current=Math.max(headRevision,snapshotRevision);
+   if(expectedRevision!==current){conflict=true;tx.abort();return;}
+   revision=current+1;
+   s.add({id:id+'::'+String(revision).padStart(12,'0'),lifeId:id,revision,json,hash:digest,at:Date.now()});
+   h.put({lifeId:id,revision});
+ }
+ head.onsuccess=()=>{headRevision=Number.isSafeInteger(head.result?.revision)&&head.result.revision>=0?head.result.revision:0;ready();};
+ latest.onsuccess=()=>{snapshotRevision=Number.isSafeInteger(latest.result?.value?.revision)?latest.result.value.revision:0;ready();};
+ tx.oncomplete=()=>ok(revision);
+ tx.onabort=()=>no(conflict?Object.assign(Error('Revision conflict'),{code:'REVISION_CONFLICT',expectedRevision}):(tx.error||Error('Write aborted')));
+ tx.onerror=()=>{};
+ });}
+// Exclusive import: occupancy check and snapshot insertion in ONE IndexedDB transaction.
+// Checking only HEAD is insufficient: an orphaned/corrupt snapshot still reserves its ID.
+function atomicImport(db,id,json,digest){return new Promise((ok,no)=>{
+ let tx;try{tx=db.transaction([SNAP,HEAD],'readwrite');}catch(e){return no(e);}
+ const h=tx.objectStore(HEAD),s=tx.objectStore(SNAP);
+ let revision=1, rejected=false;
+ const head=h.get(id), existing=s.index('lifeId').count(IDBKeyRange.only(id));
+ let headPresent=false,snapshotPresent=false,checks=0;
+ function checked(){if(++checks!==2)return;
+  if(headPresent||snapshotPresent){rejected=true;try{tx.abort();}catch{}return;}
+  s.add({id:id+'::000000000001',lifeId:id,revision,json,hash:digest,at:Date.now()});
+  h.add({lifeId:id,revision});
+ }
+ head.onsuccess=()=>{headPresent=!!head.result;checked();};
+ existing.onsuccess=()=>{snapshotPresent=existing.result>0;checked();};
+ tx.oncomplete=()=>ok(revision);
+ tx.onabort=()=>no(rejected?Error('Life ID already occupied; import refused'):(tx.error||Error('Import aborted')));
+ tx.onerror=()=>{};
+ });}
+function allRecords(db,id){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).index('lifeId').getAll(id);let out;r.onsuccess=()=>{out=r.result;};tx.oncomplete=()=>ok((out||[]).sort((a,b)=>b.revision-a.revision));tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+function exactRecord(db,id,revision){return new Promise((ok,no)=>{const tx=db.transaction(SNAP,'readonly'),r=tx.objectStore(SNAP).get(id+'::'+String(revision).padStart(12,'0'));let record;r.onsuccess=()=>{record=r.result;};tx.oncomplete=()=>ok(record);tx.onabort=()=>no(tx.error||Error('Read aborted'));});}
+async function verify(id,r){if(!r||r.lifeId!==id||typeof r.json!=='string'||typeof r.hash!=='string'||await hash(r.json)!==r.hash)return null;try{let state=JSON.parse(r.json);validState(id,state);return {revision:r.revision,state};}catch{return null;}}
+class SaveCore{
+ constructor(){this.queues=new Map();this.pending=new Map();this.MAX_PENDING_PER_LIFE=8;}
+ _enqueue(id,run){
+  const count=this.pending.get(id)||0;
+  if(count>=this.MAX_PENDING_PER_LIFE)return Promise.reject(Object.assign(Error('Save queue full; retry after pending writes settle'),{code:'SAVE_QUEUE_FULL',lifeId:id}));
+  this.pending.set(id,count+1);
+  const previous=this.queues.get(id)||Promise.resolve();
+  const task=previous.catch(()=>{}).then(run);
+  this.queues.set(id,task);
+  // Cleanup is attached to a handled promise, avoiding unhandled rejections.
+  const settled=task.then(value=>({ok:true,value}),error=>({ok:false,error}));
+  return settled.then(result=>{
+   const remaining=(this.pending.get(id)||1)-1;
+   if(remaining)this.pending.set(id,remaining);else this.pending.delete(id);
+   if(this.queues.get(id)===task)this.queues.delete(id);
+   if(result.ok)return result.value;
+   throw result.error;
+  });
+ }
+ async save(id,state,expectedRevision){
+  if(!Number.isSafeInteger(expectedRevision)||expectedRevision<0)throw Error('expectedRevision required');
+  lifeId(id);validState(id,state);
+  // Snapshot synchronously before joining the asynchronous queue.
+  // Never allow caller mutations to change the payload after save() is requested.
+  const snapshot=JSON.stringify(state);
+  if(typeof snapshot!=='string')throw Error('State serialization failed');
+  const parsed=JSON.parse(snapshot);
+  validState(id,parsed);
+  return this._enqueue(id,()=>this._saveSnapshot(id,snapshot,expectedRevision));
+ }
+ async _saveSnapshot(id,json,expectedRevision){lifeId(id);const digest=await hash(json),db=await open();let revision;try{revision=await atomicWrite(db,id,json,digest,expectedRevision);const record=await exactRecord(db,id,revision);const verified=await verify(id,record);if(!verified||record.json!==json)throw Error('Readback verification failed');return {confirmed:true,revision,hash:digest};}finally{db.close();}}
+ async importExclusive(id,state){
+  lifeId(id);validState(id,state);
+  const snapshot=JSON.stringify(state);if(typeof snapshot!=='string')throw Error('Serialization failed');
+  validState(id,JSON.parse(snapshot));
+  return this._enqueue(id,async()=>{
+   const digest=await hash(snapshot),db=await open();
+   try{const revision=await atomicImport(db,id,snapshot,digest);
+    const record=await exactRecord(db,id,revision),v=await verify(id,record);
+    if(!v||record.json!==snapshot)throw Error('Exclusive import readback failed');
+    return {confirmed:true,revision,hash:digest};
+   }finally{db.close();}
+  });
+ }
+ async load(id){lifeId(id);const db=await open();try{for(const r of await allRecords(db,id)){const v=await verify(id,r);if(v)return v;}return null;}finally{db.close();}}
+ async list(){const db=await open();try{const ids=await new Promise((ok,no)=>{const tx=db.transaction(HEAD,'readonly'),r=tx.objectStore(HEAD).getAllKeys();let keys;r.onsuccess=()=>keys=r.result;tx.oncomplete=()=>ok(keys||[]);tx.onabort=()=>no(tx.error||Error('List aborted'));});const out=[];for(const id of ids){if((await allRecords(db,id)).length){let good=false;for(const r of await allRecords(db,id)){if(await verify(id,r)){good=true;break;}}if(good)out.push(id);}}return out;}finally{db.close();}}
+ async exportLife(id){const v=await this.load(id);if(!v)throw Error('No verified save');return JSON.stringify(v.state);}
+ async importLegacy(id,json){lifeId(id);const s=JSON.parse(json);validState(id,s);return this.importExclusive(id,s);}
+}
+global.ELYRA_SaveCore_Step31=new SaveCore();
+})(globalThis);</script><script>
+const core=globalThis.ELYRA_SaveCore_Step31;let report;
+const make=(id,money)=>({identity:{lifeId:id},actors:{alex:{}},money});
+const assert=(v,m)=>{if(!v)throw Error(m)};
+async function test(name,fn){try{return {name,result:'PASS',details:await fn()}}catch(e){return {name,result:'FAIL',error:String(e)}}}
+async function openDb(){return new Promise((resolve,reject)=>{const r=indexedDB.open('elyra_savecore_ss19_lab',1);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})}
+async function abortedWrite(id){const db=await openDb();try{return await new Promise((resolve,reject)=>{
+ const tx=db.transaction(['snapshots','heads'],'readwrite');const s=tx.objectStore('snapshots'),h=tx.objectStore('heads');
+ s.put({id:id+'::000000000002',lifeId:id,revision:2,json:'{ "interrupted": true }',hash:'invalid',at:Date.now()});h.put({lifeId:id,revision:2});
+ tx.onabort=()=>resolve({aborted:true});tx.oncomplete=()=>reject(Error('Unexpected commit'));tx.onerror=()=>{};
+ // Abort after both writes have been queued; the transaction must roll back both stores.
+ tx.abort();
+ })}finally{db.close()}}
+async function run(){document.querySelector('#out').textContent='Collaudo in corso...';const tests=[];
+ const id='ss19-'+Date.now()+'-'+Math.random().toString(36).slice(2);
+ let first,afterAbort,committed;
+ tests.push(await test('snapshot iniziale verificato',async()=>{first=await core.save(id,make(id,101),0);const r=await core.load(id);assert(first.revision===1&&r.revision===1&&r.state.money===101,'initial mismatch');return {revision:r.revision,money:r.state.money}}));
+ tests.push(await test('abort atomico di due object store',async()=>{const a=await abortedWrite(id);afterAbort=await core.load(id);assert(a.aborted&&afterAbort.revision===1&&afterAbort.state.money===101,'rollback failed');const db=await openDb();try{const result=await new Promise((resolve,reject)=>{const tx=db.transaction(['heads','snapshots'],'readonly');const h=tx.objectStore('heads').get(id),s=tx.objectStore('snapshots').get(id+'::000000000002');tx.oncomplete=()=>resolve({head:h.result?.revision,snapshotExists:!!s.result});tx.onerror=()=>reject(tx.error)});assert(result.head===1&&!result.snapshotExists,'partial transaction');return result}finally{db.close()}}));
+ tests.push(await test('salvataggio valido dopo abort',async()=>{committed=await core.save(id,make(id,202),1);const r=await core.load(id);assert(committed.revision===2&&r.revision===2&&r.state.money===202,'post-abort save mismatch');return {revision:r.revision,money:r.state.money}}));
+ tests.push(await test('conferma simulata perduta: riconciliazione',async()=>{const token=committed.hash; // simulate caller discarding success reply
+ const r=await core.load(id);assert(r.revision===2&&r.hash===token&&r.state.money===202,'cannot reconcile');return {acknowledgement:'simulated lost',verifiedRevision:r.revision,hashMatches:true}}));
+ tests.push(await test('ritentativo obsoleto rifiutato senza duplicazione',async()=>{let code;try{await core.save(id,make(id,202),1)}catch(e){code=e.code}assert(code==='REVISION_CONFLICT','stale retry accepted');const db=await openDb();try{const count=await new Promise((resolve,reject)=>{const tx=db.transaction('snapshots','readonly');const r=tx.objectStore('snapshots').index('lifeId').count(IDBKeyRange.only(id));r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});assert(count===2,'duplicate snapshot');return {error:code,snapshots:count}}finally{db.close()}}));
+ report={environment:{origin:location.origin,indexedDB:!!globalThis.indexedDB,cryptoSubtle:!!crypto?.subtle},limitations:['No real process kill, power loss, quota failure or cross-tab crash is simulated','Acknowledgement loss is simulated after a successful commit','These tests do not establish a production recovery protocol'],tests};document.querySelector('#out').textContent=JSON.stringify(report,null,2);
+}
+document.querySelector('#run').onclick=()=>run().catch(e=>document.querySelector('#out').textContent=String(e));document.querySelector('#copy').onclick=async()=>{if(!report)return alert('Esegui prima il collaudo');const s=JSON.stringify(report,null,2);try{await navigator.clipboard.writeText(s);alert('Rapporto copiato')}catch{const t=document.createElement('textarea');t.value=s;document.body.appendChild(t);t.select();document.execCommand('copy');t.remove();alert('Rapporto copiato')}};
+</script></html>
