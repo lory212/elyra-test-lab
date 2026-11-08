@@ -1,0 +1,45 @@
+name: ELYRA — Core e orologio V2
+
+on:
+  push:
+    paths:
+      - 'ELYRA_0_17_THREE_SLOTS_PLAYABLE_C4_SCHOOL_CLOCK_LAB.html'
+      - 'ELYRA_CI_CORE_V1.cjs'
+      - 'ELYRA_TIME_STANDARD_V2.cjs'
+      - 'ELYRA_TIMECORE_STATIC_AUDIT_V1.cjs'
+      - '.github/workflows/elyra-clock-v2.yml'
+  pull_request:
+    paths:
+      - 'ELYRA_0_17_THREE_SLOTS_PLAYABLE_C4_SCHOOL_CLOCK_LAB.html'
+      - 'ELYRA_CI_CORE_V1.cjs'
+      - 'ELYRA_TIME_STANDARD_V2.cjs'
+      - 'ELYRA_TIMECORE_STATIC_AUDIT_V1.cjs'
+      - '.github/workflows/elyra-clock-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  engine-time:
+    name: ELYRA C4 — real engine & clock regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Regressioni Core V1
+        run: node ELYRA_CI_CORE_V1.cjs
+      - name: Standard orario V2
+        run: node ELYRA_TIME_STANDARD_V2.cjs
+      - name: Inventario statico moduli temporali
+        if: always()
+        run: node ELYRA_TIMECORE_STATIC_AUDIT_V1.cjs
+      - name: Pubblica rapporti del collaudo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: elyra-core-clock-v2-reports
+          path: artifacts/*.json
+          if-no-files-found: warn
