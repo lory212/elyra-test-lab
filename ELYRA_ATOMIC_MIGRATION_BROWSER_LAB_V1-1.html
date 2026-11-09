@@ -1,0 +1,301 @@
+<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#111827"><title>ELYRA — Migrazione atomica isolata V1.1</title><style>html{color-scheme:dark}body{margin:0;background:#101723;color:#edf2fa;font:16px system-ui,sans-serif}main{max-width:720px;margin:auto;padding:20px}button{font:inherit;border:0;border-radius:10px;padding:12px 16px;background:#e6ba81;color:#171b22;font-weight:700;margin:8px 6px 8px 0}button:disabled{opacity:.5}.panel{border:1px solid #3d4a61;border-radius:14px;background:#172438;padding:16px;margin:14px 0}pre{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:450px;overflow:auto}.warn{color:#f7c995}.green{color:#77d9ab}small{color:#a9bdd4}code{overflow-wrap:anywhere}</style></head><body><main><h1>ELYRA / Migrazione atomica isolata V1.1</h1><p>Collaudo su IndexedDB reale del browser, con <b>vite esclusivamente sintetiche</b>. Nessuna partita C4 originale viene aperta, copiata o eliminata.</p><div class="panel"><b>Stato:</b> <span id="status">Da avviare</span><p><button id="run">Esegui collaudo automatico</button><button id="copy" disabled>Copia rapporto JSON</button></p><small>Serve un'origine che autorizzi IndexedDB, come HTTPS. Il test non effettua richieste internet e non usa i database del gioco.</small></div><div class="panel"><h3>Risultati</h3><pre id="log">Nessun controllo eseguito.</pre></div><p class="warn">Limiti: non testa decoder reali C4 nel browser, crash Android, storage pieno o migrazione fra domini. Non sostituisce il laboratorio SaveCore V1.5.</p></main><script>
+/* ELYRA SaveCore migration preflight v1.0.
+ * Pure, read-only: accepts already-read records and NEVER opens/writes IndexedDB.
+ * Compatible with CommonJS and ordinary offline browser scripts.
+ * This is NOT a migration executor. Importing/migrating is disabled by design.
+ */
+(function (root, factory) {
+  'use strict';
+  const api = factory();
+  if (typeof module === 'object' && module.exports) module.exports = api;
+  else root.ELYRA_SaveMigrationPreflightV1 = api;
+})(typeof window !== 'undefined' ? window : {}, function () {
+  'use strict';
+  const validSlot = n => Number.isSafeInteger(n) && n >= 1 && n <= 3;
+  const simpleError = err => String(err?.message || err).slice(0, 220);
+  function inspectRecord(rec, slot, validate, decode, sha256) {
+    if (!validSlot(slot)) throw Error('INVALID_SLOT');
+    if (!rec) return {slot, state: 'EMPTY'};
+    try {
+      if (rec.__readError) throw Error('IDB_READ_FAILURE:' + String(rec.__readError).slice(0, 120));
+      if (!rec || typeof rec !== 'object' || Array.isArray(rec)) throw Error('INVALID_RECORD');
+      if (rec.slot !== slot) throw Error('SLOT_RECORD_MISMATCH');
+      if (typeof rec.lifeId !== 'string' || !rec.lifeId) throw Error('MISSING_LIFE_ID');
+      if (!['a', 'b'].includes(rec.head)) throw Error('INVALID_HEAD');
+      // Decode is the *actual version-specific slot decoder* supplied by C4 or V2.
+      // It selects a valid head or its last-known-good alternate.
+      const data = decode(rec, validate);
+      if (!data || !data.world || !Number.isSafeInteger(data.rev) || data.rev <= 0) throw Error('INVALID_DECODE');
+      const side = data.recovered ? (rec.head === 'a' ? 'b' : 'a') : rec.head;
+      const snap = rec[side];
+      if (!snap || snap.slot !== slot || snap.rev !== data.rev || typeof snap.raw !== 'string') throw Error('BAD_SELECTED_SNAPSHOT');
+      if (snap.raw.length > 10_000_000) throw Error('SNAPSHOT_TOO_LARGE');
+      const lifeId = data.world?.identity?.lifeId;
+      if (lifeId !== rec.lifeId) throw Error('IDENTITY_MISMATCH');
+      const alternate = rec[side === 'a' ? 'b' : 'a'];
+      const warnings = [];
+      if (data.recovered) warnings.push('RECOVERED_OLDER_SNAPSHOT');
+      try {
+        const stored = JSON.parse(snap.raw);
+        if (stored?.version !== data.world.version) warnings.push('SCHEMA_MIGRATION_REQUIRED');
+        else if (JSON.stringify(stored) !== JSON.stringify(data.world)) warnings.push('CONTENT_MIGRATION_REQUIRED');
+      } catch (_) { warnings.push('RAW_WORLD_FORMAT_UNREADABLE'); }
+      if (!data.recovered && alternate) {
+        if (alternate.rev >= snap.rev) warnings.push('REVISION_ORDER_ANOMALY');
+        try {
+          if (alternate.slot !== slot || !Number.isSafeInteger(alternate.rev) || alternate.rev <= 0 || typeof alternate.raw !== 'string') throw Error('BAD_BACKUP_METADATA');
+          const previous = validate(alternate.raw);
+          if (previous?.identity?.lifeId !== lifeId) warnings.push('BACKUP_IDENTITY_MISMATCH');
+        } catch (_) { warnings.push('INVALID_BACKUP_SNAPSHOT'); }
+      }
+      return {slot, state: 'VALID', lifeId, rev: data.rev, time: data.world.t, version: data.world.version,
+        recovered: !!data.recovered, warnings, digest: typeof sha256 === 'function' ? sha256(snap.raw) : null,
+        // raw is held only in this private in-memory result; never included in the report.
+        _raw: snap.raw};
+    } catch (err) {
+      return {slot, state: 'INVALID', code: 'DECODE_ERROR', reason: simpleError(err)};
+    }
+  }
+  function summarize(item) {
+    const { _raw, ...publicFields } = item;
+    return publicFields;
+  }
+  function inspect({source, target, validateSource, validateTarget, decodeSource, decodeTarget, sha256}) {
+    if (!Array.isArray(source) || !Array.isArray(target) || source.length !== 3 || target.length !== 3)
+      throw Error('REQUIRE_THREE_SLOT_RECORDS');
+    if (![validateSource, validateTarget, decodeSource, decodeTarget].every(f => typeof f === 'function'))
+      throw Error('MISSING_REAL_WORLD_VALIDATOR_OR_DECODER');
+    const from = [1, 2, 3].map(n => inspectRecord(source[n-1], n, validateSource, decodeSource, sha256));
+    const to = [1, 2, 3].map(n => inspectRecord(target[n-1], n, validateTarget, decodeTarget, sha256));
+    const blockers = [], warnings = [], plan = [];
+    const invalid = (items, kind) => items.forEach(x => { if (x.state === 'INVALID') blockers.push(`${kind}_INVALID_SLOT_${x.slot}: ${x.reason}`); });
+    invalid(from, 'SOURCE'); invalid(to, 'TARGET');
+    const duplicates = (items, kind) => {
+      const seen = new Map();
+      for (const x of items) {
+        if (x.state !== 'VALID') continue;
+        if (seen.has(x.lifeId)) blockers.push(`${kind}_DUPLICATE_LIFE_ID_SLOTS_${seen.get(x.lifeId)}_${x.slot}`);
+        else seen.set(x.lifeId, x.slot);
+      }
+    };
+    duplicates(from, 'SOURCE'); duplicates(to, 'TARGET');
+    // Both versions must decode the source bytes successfully before a COPY can even be contemplated.
+    for (const s of from) {
+      if (s.state !== 'VALID') continue;
+      try { const w = validateTarget(s._raw); if (w?.identity?.lifeId !== s.lifeId) throw Error('TARGET_IDENTITY_DIFFERENCE'); }
+      catch (e) { blockers.push(`TARGET_CANNOT_DECODE_SOURCE_SLOT_${s.slot}:${simpleError(e)}`); }
+    }
+    const targetIdSlots = new Map(to.filter(x => x.state === 'VALID').map(x => [x.lifeId, x.slot]));
+    for (let i = 0; i < 3; i++) {
+      const a = from[i], b = to[i];
+      if (a.state !== 'VALID') { plan.push({slot:i+1,action:a.state === 'EMPTY' ? 'NONE' : 'BLOCK'}); continue; }
+      for (const w of a.warnings) warnings.push(`SOURCE_SLOT_${a.slot}_${w}`);
+      const inTarget = targetIdSlots.get(a.lifeId);
+      if (inTarget && inTarget !== a.slot) blockers.push(`IDENTITY_IN_OTHER_TARGET_SLOT_${a.slot}_${inTarget}`);
+      if (b.state === 'INVALID') { plan.push({slot:a.slot,action:'BLOCK'}); continue; }
+      if (b.state === 'VALID') {
+        if (a.lifeId !== b.lifeId) { blockers.push(`TARGET_SLOT_${a.slot}_OCCUPIED_BY_DIFFERENT_LIFE`); plan.push({slot:a.slot,action:'BLOCK'}); }
+        else if (a._raw === b._raw) plan.push({slot:a.slot,action:'ALREADY_IDENTICAL'});
+        else { blockers.push(`TARGET_SLOT_${a.slot}_DIFFERENT_SNAPSHOT`); plan.push({slot:a.slot,action:'BLOCK'}); }
+      } else plan.push({slot:a.slot,action:'COPY_CANDIDATE'});
+    }
+    const uniqueBlockers = [...new Set(blockers)];
+    const eligibleForStaging = uniqueBlockers.length === 0 && warnings.length === 0;
+    return {
+      schema: 'elyra.savecore.migration.preflight/1',
+      scope: 'READ_ONLY_SYNTHETIC_OR_SUPPLIED_RECORDS',
+      migrationExecuted: false,
+      writesPerformed: 0,
+      safeToWriteWithoutApproval: false,
+      status: uniqueBlockers.length ? 'BLOCKED' : warnings.length ? 'REVIEW_REQUIRED' : 'READY_FOR_STAGING',
+      eligibleForStaging,
+      sourceSlots: from.map(summarize), targetSlots: to.map(summarize),
+      plan,
+      blockers: uniqueBlockers,
+      warnings,
+      limitations: [
+        'Never run on production without backups, explicit approval, and a verified transactional migration runner',
+        'This is a read-only preflight: no IndexedDB writes and no automatic transfer between website and Android app origins',
+        'A preflight does not guarantee device storage durability, migration atomicity, or correctness on Android',
+        'Generated report excludes world raw JSON; synthetic fixtures are used in bundled tests'
+      ]
+    };
+  }
+  return { inspect, inspectRecord };
+});
+
+/* ELYRA Atomic Migration Sandbox 0.1 — offline, development ONLY.
+ * Runs only against explicit experimental storage adapters. Never creates,
+ * changes or deletes the original C4/SaveCore production databases.
+ * Three slot records are committed in ONE target IDB readwrite transaction.
+ * No cross-database atomicity is claimed; no source DB is altered.
+ */
+(function(root, factory){'use strict';const api=factory();
+ if(typeof module==='object'&&module.exports)module.exports=api;
+ else root.ELYRA_AtomicMigrationSandboxV1=api;
+})(typeof window==='undefined'?{}:window,function(){'use strict';
+ const PREFIX='elyra_migration_sandbox_';
+ const validNamespace=n=>typeof n==='string'&&n.startsWith(PREFIX)&&/^[a-zA-Z0-9_]+$/.test(n)&&n.length<125;
+ const clone=x=>x==null?null:JSON.parse(JSON.stringify(x));
+ const eq=(a,b)=>JSON.stringify(a??null)===JSON.stringify(b??null);
+ const fault=(code)=>{const e=new Error(code);e.code=code;return e};
+ function requireAdapter(a){if(!a||!validNamespace(a.namespace)||typeof a.readAll!=='function'||typeof a.compareAndPutMany!=='function')throw fault('EXPERIMENTAL_ADAPTER_REQUIRED');}
+ function checkTriple(records){if(!Array.isArray(records)||records.length!==3)throw fault('THREE_RECORDS_REQUIRED');return records.map((r,i)=>{if(r!=null&&(typeof r!=='object'||r.slot!==i+1))throw fault('SLOT_MISMATCH');return clone(r)});}
+ function reportPart(r){return r.map((v,i)=>({slot:i+1,occupied:!!v,revision:v?.[v?.head]?.rev??null}));}
+ async function perform({sourceStore,targetStore,preflight,validateSource,validateTarget,decodeSource,decodeTarget,sha256,verifySource=true}){
+  requireAdapter(sourceStore);requireAdapter(targetStore);
+  if(sourceStore.namespace===targetStore.namespace)throw fault('SOURCE_TARGET_SAME');
+  if(typeof preflight!=='function')throw fault('MISSING_PREFLIGHT');
+  const source=checkTriple(await sourceStore.readAll()),target=checkTriple(await targetStore.readAll());
+  const check=()=>preflight({source,target,validateSource,validateTarget,decodeSource,decodeTarget,sha256});
+  const before=check();
+  if(before.status!=='READY_FOR_STAGING'||!before.eligibleForStaging)throw fault('PREFLIGHT_'+before.status);
+  // In addition to preflight-selected snapshot equivalence, preserve ALL snapshot metadata
+  // including backup and revisions. A merely compatible but different target is rejected.
+  const desired=source.map((r,i)=>{
+   const t=target[i];
+   if(t&&!eq(t,r))throw fault('TARGET_NOT_BYTE_IDENTICAL_SLOT_'+(i+1));
+   return r;
+  });
+  // Independent second read detects source changes between planning and commit.
+  // A later concurrent writer is still possible across different IndexedDB databases.
+  if(verifySource&&!eq(checkTriple(await sourceStore.readAll()),source))throw fault('SOURCE_CHANGED');
+  const pending=desired.filter((r,i)=>r&&!target[i]).length;
+  let commitError=null;
+  try{await targetStore.compareAndPutMany(target,desired)}catch(e){commitError=e;}
+  // Read-back after an uncertain commit is authoritative: NEVER retry blindly.
+  let saved;
+  try{saved=checkTriple(await targetStore.readAll())}catch(e){
+   throw fault('COMMIT_UNVERIFIABLE:'+String(e?.code||e?.message||e).slice(0,80));
+  }
+  if(!eq(saved,desired)){
+   if(commitError)throw fault('TRANSACTION_ABORTED:'+String(commitError?.code||commitError?.message||commitError).slice(0,80));
+   throw fault('POST_COMMIT_MISMATCH');
+  }
+  if(verifySource&&!eq(checkTriple(await sourceStore.readAll()),source))throw fault('SOURCE_CHANGED_POST_COMMIT_QUARANTINE');
+  const after=preflight({source,target:saved,validateSource,validateTarget,decodeSource,decodeTarget,sha256});
+  if(after.status!=='READY_FOR_STAGING')throw fault('POST_COMMIT_PREFLIGHT_'+after.status);
+  // No user payloads included in result. Source is never mutated by this engine.
+  return {schema:'elyra.savecore.atomic-sandbox/1',status:pending===0?'ALREADY_PRESENT':commitError?'RECOVERED_UNCERTAIN_COMMIT':'COPIED',sourceNamespace:sourceStore.namespace,targetNamespace:targetStore.namespace,
+   copies:pending,sourceSlots:reportPart(source),targetSlots:reportPart(saved),originalSourceUntouched:true,verified:true,
+   warning:'TEST-ONLY. Not integrated into C4. Not a cross-origin, Android or production migration.'};
+ }
+ function createIDBAdapter(indexedDB,namespace,testing={}){
+  // Fault injection is permitted ONLY for experimental namespaces, never for game storage.
+  const abortAfterPutN=testing.abortAfterPutN==null?0:testing.abortAfterPutN;
+  if(!Number.isSafeInteger(abortAfterPutN)||abortAfterPutN<0||abortAfterPutN>3)throw fault('INVALID_FAULT_CONFIGURATION');
+  if(!validNamespace(namespace))throw fault('EXPERIMENTAL_NAMESPACE_ONLY');
+  if(!indexedDB||typeof indexedDB.open!=='function')throw fault('IDB_UNAVAILABLE');
+  const open=()=>new Promise((resolve,reject)=>{
+   const req=indexedDB.open(namespace,1);
+   req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains('lives'))req.result.createObjectStore('lives')};
+   req.onsuccess=()=>resolve(req.result);
+   req.onerror=()=>reject(req.error||fault('IDB_OPEN_FAILED'));
+   req.onblocked=()=>reject(fault('IDB_BLOCKED'));
+  });
+  const all=db=>new Promise((resolve,reject)=>{
+   let tx;try{tx=db.transaction('lives','readonly')}catch(e){reject(e);return}
+   const result=[null,null,null];let err=null;
+   tx.oncomplete=()=>resolve(result);
+   tx.onabort=()=>reject(err||tx.error||fault('READ_ABORT'));
+   tx.onerror=()=>{err=tx.error||fault('READ_ERROR')};
+   const st=tx.objectStore('lives');
+   for(let i=1;i<=3;i++){
+    const req=st.get('life:'+i);
+    req.onsuccess=()=>{result[i-1]=clone(req.result)};
+   }
+  });
+  return {
+   namespace,
+   async readAll(){const db=await open();try{return await all(db)}finally{db.close()}},
+   async compareAndPutMany(expected,desired){
+    const e=checkTriple(expected),d=checkTriple(desired);const db=await open();try{
+     return await new Promise((resolve,reject)=>{
+      const tx=db.transaction('lives','readwrite');let errored=null,completed=false,got=0;
+      const current=[null,null,null], st=tx.objectStore('lives');let queuedPuts=0;
+      const abort=code=>{errored=fault(code);try{tx.abort()}catch(_){};};
+      tx.oncomplete=()=>{completed=true;resolve({committed:true})};
+      tx.onabort=()=>reject(errored||tx.error||fault('WRITE_ABORT'));
+      tx.onerror=()=>{errored=errored||tx.error||fault('WRITE_ERROR')};
+      // Queue all reads NOW, before asynchronous request handlers execute.
+      for(let i=1;i<=3;i++){
+       const r=st.get('life:'+i);
+       r.onsuccess=()=>{
+        current[i-1]=clone(r.result);got++;
+        if(got===3){
+         for(let j=0;j<3;j++)if(!eq(current[j],e[j])){abort('TARGET_CHANGED');return}
+         for(let j=0;j<3;j++){
+          if(!d[j]){if(current[j]){abort('UNEXPECTED_TARGET');return};continue}
+          if(!current[j]){st.put(clone(d[j]),'life:'+(j+1));queuedPuts++;if(abortAfterPutN&&queuedPuts===abortAfterPutN){abort('INJECTED_TX_ABORT');return}}
+         }
+        }
+       };
+      }
+     });
+    }finally{db.close()}
+   }
+  };
+ }
+ return {perform,createIDBAdapter,validNamespace};
+});
+
+(function(){'use strict';
+ const {perform,createIDBAdapter}=window.ELYRA_AtomicMigrationSandboxV1;
+ const {inspect}=window.ELYRA_SaveMigrationPreflightV1;
+ const btn=document.getElementById('run'),copy=document.getElementById('copy'),status=document.getElementById('status'),log=document.getElementById('log');
+ const clone=x=>x==null?null:JSON.parse(JSON.stringify(x));
+ const equal=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+ let counter=0,report=null;
+ const sandboxNames=[];
+ function assertion(condition,message){if(!condition)throw Error(message)}
+ function world(n){return {version:7,identity:{lifeId:'synthetic-'+n},t:405};}
+ function validate(raw){const w=JSON.parse(raw);if(w.version!==7)throw Error('SCHEMA_NOT_7');if(typeof w.identity?.lifeId!=='string'||!Number.isSafeInteger(w.t))throw Error('INVALID_WORLD');return w}
+ function decode(record,validateRaw){for(const side of [record.head,record.head==='a'?'b':'a']){try{const s=record[side];if(s.slot!==record.slot)throw Error('SLOT');const w=validateRaw(s.raw);if(w.identity.lifeId!==record.lifeId)throw Error('LIFE');return {world:w,rev:s.rev,recovered:side!==record.head}}catch(e){}}throw Error('CORRUPT_SNAPSHOTS')}
+ const fixtures=[1,2,3].map(n=>({slot:n,head:'a',lifeId:world(n).identity.lifeId,a:{slot:n,rev:1,raw:JSON.stringify(world(n))},b:null}));
+ const ctx=(src,dst)=>({sourceStore:src,targetStore:dst,preflight:inspect,validateSource:validate,validateTarget:validate,decodeSource:decode,decodeTarget:decode});
+ async function checkThrows(p,word){try{await p;throw Error('EXPECTED_ERROR_NOT_THROWN:'+word)}catch(e){if(String(e.message).startsWith('EXPECTED_ERROR_NOT_THROWN'))throw e;assertion(String(e.message).includes(word),String(e.message))}}
+ async function setup(suffix,items=fixtures){counter++;const id=String(Date.now())+'_'+counter+'_'+suffix;const src=createIDBAdapter(indexedDB,'elyra_migration_sandbox_bsrc_'+id),dst=createIDBAdapter(indexedDB,'elyra_migration_sandbox_bdst_'+id);
+  sandboxNames.push(src.namespace,dst.namespace);await src.compareAndPutMany([null,null,null],items);return {src,dst,opts:ctx(src,dst)} }
+ async function overwriteSynthetic(name,record){
+  assertion(/^elyra_migration_sandbox_bsrc_[a-zA-Z0-9_]+$/.test(name),'UNSAFE_SOURCE_NAMESPACE');
+  const db=await new Promise((resolve,reject)=>{const request=indexedDB.open(name,1);request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error||Error('TEST_OPEN_ERROR'))});
+  try{await new Promise((resolve,reject)=>{const tx=db.transaction('lives','readwrite');tx.oncomplete=()=>resolve();tx.onabort=()=>reject(tx.error||Error('TEST_WRITE_ABORT'));tx.onerror=()=>reject(tx.error||Error('TEST_WRITE_ERROR'));tx.objectStore('lives').put(clone(record),'life:'+record.slot)})}finally{db.close()}
+ }
+ async function cleanupSandbox(){
+  const names=[...new Set(sandboxNames)];
+  for(const name of names){
+   assertion(/^elyra_migration_sandbox_b(?:src|dst)_[a-zA-Z0-9_]+$/.test(name),'UNSAFE_CLEANUP_NAMESPACE');
+   await new Promise((resolve,reject)=>{let request;try{request=indexedDB.deleteDatabase(name)}catch(e){reject(e);return}request.onsuccess=()=>resolve();request.onerror=()=>reject(request.error||Error('SANDBOX_CLEANUP_ERROR'));request.onblocked=()=>reject(Error('SANDBOX_CLEANUP_BLOCKED:'+name))});
+  }
+  if(typeof indexedDB.databases==='function'){
+   const listed=await indexedDB.databases();const found=listed.filter(db=>names.includes(db.name));assertion(found.length===0,'SANDBOX_DATABASES_NOT_REMOVED');
+  }
+  sandboxNames.length=0;return 'Cancellati '+names.length+' database esclusivamente sintetici';
+ }
+ async function add(name,fn){try{const detail=await fn();report.tests.push({id:'IDB-'+String(report.tests.length+1).padStart(2,'0'),label:name,status:'PASS',detail:detail||''});log.textContent+='PASS · '+name+'\n';}
+ catch(e){report.tests.push({id:'IDB-'+String(report.tests.length+1).padStart(2,'0'),label:name,status:'FAIL',error:String(e.message||e)});log.textContent+='FAIL · '+name+': '+String(e.message||e)+'\n';throw e}}
+ async function execute(){if(!indexedDB)throw Error('IndexedDB mancante');await add('IndexedDB disponibile e nomi sperimentali',async()=>{const a=await setup('check');assertion((await a.src.readAll()).length===3,'src');assertion((await a.dst.readAll()).every(x=>x===null),'dst')});
+ await add('Copia atomica delle tre vite sintetiche',async()=>{const a=await setup('copy');const r=await perform(a.opts);assertion(r.status==='COPIED','result');assertion(equal(await a.dst.readAll(),fixtures),'content');window.__elyraRepeat=a});
+ await add('Ripetizione idempotente',async()=>{const a=window.__elyraRepeat;const r=await perform(a.opts);assertion(r.copies===0,'duplicate operation')});
+ await add('La sorgente resta invariata',async()=>{assertion(equal(await window.__elyraRepeat.src.readAll(),fixtures),'source changed')});
+ await add('Abort nella seconda scrittura: nessuna vita copiata',async()=>{const a=await setup('abort2');const dst=createIDBAdapter(indexedDB,a.dst.namespace,{abortAfterPutN:2});await checkThrows(perform({...a.opts,targetStore:dst}),'TRANSACTION_ABORTED');assertion((await a.dst.readAll()).every(x=>x===null),'partial commit')});
+ await add('Riprova dopo abort: copie esattamente tre',async()=>{const a=await setup('retry');const dst=createIDBAdapter(indexedDB,a.dst.namespace,{abortAfterPutN:2});await checkThrows(perform({...a.opts,targetStore:dst}),'TRANSACTION_ABORTED');const x=await perform(a.opts);assertion(x.copies===3,'count');assertion(equal(await a.dst.readAll(),fixtures),'missing')});
+ await add('Abort nella terza scrittura: nessuna vita copiata',async()=>{const a=await setup('abort3');const dst=createIDBAdapter(indexedDB,a.dst.namespace,{abortAfterPutN:3});await checkThrows(perform({...a.opts,targetStore:dst}),'TRANSACTION_ABORTED');assertion((await a.dst.readAll()).every(x=>x===null),'partial third')});
+ await add('Commit riuscito, conferma perduta e recupero',async()=>{const a=await setup('ack');const dst={...a.dst,compareAndPutMany:async(e,d)=>{await a.dst.compareAndPutMany(e,d);throw Error('ACK_LOST')}};const r=await perform({...a.opts,targetStore:dst});assertion(r.status==='RECOVERED_UNCERTAIN_COMMIT','ack');assertion(equal(await a.dst.readAll(),fixtures),'missing')});
+ await add('Report blocca duplicati fra vite',async()=>{const r=clone(fixtures);r[2]=clone(r[0]);r[2].slot=3;r[2].a.slot=3;const a=await setup('dup',r);await checkThrows(perform(a.opts),'PREFLIGHT_BLOCKED');assertion((await a.dst.readAll()).every(x=>x===null),'writes')});
+ await add('Report blocca dati danneggiati',async()=>{const r=clone(fixtures);r[0].a.raw='BAD_JSON';const a=await setup('damaged',r);await checkThrows(perform(a.opts),'PREFLIGHT_BLOCKED');assertion((await a.dst.readAll()).every(x=>x===null),'writes')});
+ await add('Destinazione diversa non viene sovrascritta',async()=>{const a=await setup('occupied');const r=clone(fixtures);r[1].a.raw=JSON.stringify({...world(2),t:500});await a.dst.compareAndPutMany([null,null,null],[null,r[1],null]);await checkThrows(perform(a.opts),'PREFLIGHT_BLOCKED');assertion(equal((await a.dst.readAll())[1],r[1]),'data changed')});
+ await add('Schema storico 6: revisione richiesta',async()=>{const r=clone(fixtures);r[0].a.raw=JSON.stringify({...world(1),version:6});const a=await setup('schema6',r);await checkThrows(perform(a.opts),'PREFLIGHT_BLOCKED')});
+ await add('Due tentativi concorrenti: archivio finale coerente',async()=>{const a=await setup('race');const all=await Promise.allSettled([perform(a.opts),perform(a.opts)]);assertion(all.some(x=>x.status==='fulfilled'),'no migration');assertion(equal(await a.dst.readAll(),fixtures),'race data')});
+ await add('Sorgente modificata prima del commit: migrazione rifiutata',async()=>{const a=await setup('srcchange');let reads=0;const src={...a.src,readAll:async()=>{if(++reads===2){const r=clone(fixtures[0]);r.a.raw=JSON.stringify({...world(1),t:499});await overwriteSynthetic(a.src.namespace,r)}return a.src.readAll()}};await checkThrows(perform({...a.opts,sourceStore:src}),'SOURCE_CHANGED');assertion((await a.dst.readAll()).every(x=>x===null),'target was written')});
+ await add('Sorgente modificata dopo il commit: risultato in quarantena',async()=>{const a=await setup('aftercommit');const dst={...a.dst,compareAndPutMany:async(e,d)=>{await a.dst.compareAndPutMany(e,d);const r=clone(fixtures[2]);r.a.raw=JSON.stringify({...world(3),t:612});await overwriteSynthetic(a.src.namespace,r)}};await checkThrows(perform({...a.opts,targetStore:dst}),'SOURCE_CHANGED_POST_COMMIT_QUARANTINE');assertion(equal(await a.dst.readAll(),fixtures),'target snapshot');assertion(JSON.parse((await a.src.readAll())[2].a.raw).t===612,'source did not change')});
+ await add('Lettura post-commit non disponibile: nessun falso successo',async()=>{const a=await setup('unverified');let reads=0;const dst={...a.dst,readAll:async()=>{if(++reads===2)throw Error('READBACK_UNAVAILABLE');return a.dst.readAll()}};await checkThrows(perform({...a.opts,targetStore:dst}),'COMMIT_UNVERIFIABLE');assertion(equal(await a.dst.readAll(),fixtures),'target was unexpectedly missing');const r=await perform(a.opts);assertion(r.status==='ALREADY_PRESENT'&&r.copies===0,'duplicate retry')});
+ await add('Nomi dei database originali non utilizzati',async()=>{assertion(window.ELYRA_AtomicMigrationSandboxV1.validNamespace('elyra_migration_sandbox_test'),'namespace');assertion(!window.ELYRA_AtomicMigrationSandboxV1.validNamespace('elyra_017_playable_slots_c4_school_clock'),'original prefix')});
+ await add('Pulizia degli archivi creati soltanto dal laboratorio',async()=>await cleanupSandbox());
+ }
+ btn.addEventListener('click',async()=>{btn.disabled=true;copy.disabled=true;log.textContent='';report={schema:'elyra.guardian.report/1',version:'elyra.atomic-browser-sandbox/1.1',releaseEligible:false,title:'ELYRA — Atomic Migration Sandbox V1.1 Browser Lab',date:new Date().toISOString(),scope:'Browser IndexedDB real; synthetic lives and simplified browser validators; NOT the original C4 game, Android crash, production storage or V1.5 lab',tests:[],result:'RUNNING',passed:0,failed:0};
+  try{await execute();report.result='PASS'}catch(e){report.result='FAIL'}finally{if(sandboxNames.length){try{await cleanupSandbox()}catch(e){report.tests.push({id:'CLEANUP-ERROR',label:'Pulizia protetta degli archivi di test',status:'FAIL',error:String(e.message||e)});report.result='FAIL';log.textContent+='FAIL · pulizia sandbox: '+String(e.message||e)+'\n'}}const pending=[['B-PEND-01','Decoder completi della C4 in browser'],['B-PEND-02','Android offline reale'],['B-PEND-03','Interruzione del processo e memoria quasi piena'],['B-PEND-04','Migrazione reale fra origini o database del gioco'],['B-PEND-05','Migrazione completa con sorgente bloccata e attivazione nel gioco']];for(const [id,title]of pending)report.tests.push({id,title,status:'NOT TESTED'});report.passed=report.tests.filter(x=>x.status==='PASS').length;report.failed=report.tests.filter(x=>x.status==='FAIL').length;report.summary={'PASS':report.passed,'FAIL':report.failed,'NOT TESTED':pending.length};status.textContent=report.result+' · '+report.passed+' PASS · '+report.failed+' FAIL · '+pending.length+' NON ESEGUITI';copy.disabled=false;btn.disabled=false;delete window.__elyraRepeat;}}
+ );
+ copy.addEventListener('click',async()=>{if(!report)return;const str=JSON.stringify(report,null,2);try{await navigator.clipboard.writeText(str);status.textContent+=' · Copiato'}catch(e){const tmp=document.createElement('textarea');tmp.value=str;document.body.appendChild(tmp);tmp.select();try{document.execCommand('copy');status.textContent+=' · Copiato'}finally{tmp.remove()}}});
+})();
+</script></body></html>
